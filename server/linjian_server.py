@@ -12,6 +12,7 @@ from __future__ import annotations
 import calendar
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -23,12 +24,27 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
+from memory_store import (
+    MAX_ACTIVE_CHARS,
+    MAX_HISTORY_ITEMS,
+    MAX_HISTORY_SEARCHABLE_CHARS,
+    MAX_HISTORY_SOURCE_CHARS,
+    MAX_HISTORY_SUMMARY_CHARS,
+    MAX_QUERY_CHARS,
+    MemoryAuthError,
+    MemoryConflictError,
+    MemoryDatabaseError,
+    MemoryStore,
+    MemoryValidationError,
+)
+
 DEFAULT_PORT = 8513
 DEFAULT_KEEP = 3
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
 VERSION = "0.3.7.9"
 DEFAULT_DEVICE = os.environ.get("LINJIAN_DEFAULT_DEVICE", "android-phone")
 ACTIVITY_EVENT_LIMIT = 500
+MAX_MEMORY_REQUEST_BYTES = 32 * 1024
 
 ERR_BAD_TOKEN = "LINJIAN_ERR_BAD_TOKEN"
 ERR_NO_IMAGE = "LINJIAN_ERR_NO_IMAGE"
@@ -190,6 +206,10 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def parse_iso_seconds(value: str) -> float:
     try: return calendar.timegm(time.strptime(str(value or ""), "%Y-%m-%dT%H:%M:%SZ"))
     except Exception: return 0.0
@@ -229,6 +249,48 @@ class State:
         self.activity_path = self.data_dir / "activity_events.json"
         self.activity_lock = Lock()
         self.activity_events = self._load_activity_events()
+        self.memory_audit_path = self.data_dir / "memory_audit.jsonl"
+        self.memory_audit_lock = Lock()
+        self.memory_enabled = env_enabled("MEMORY_ENABLED")
+        self.memory_ready = False
+        self.memory_error = ""
+        self.memory_store = None
+        if self.memory_enabled:
+            self._initialize_memory()
+
+    def _initialize_memory(self) -> None:
+        database_url = os.environ.get("DATABASE_URL", "").strip()
+        pepper = os.environ.get("MEMORY_CREDENTIAL_PEPPER", "").strip()
+        if not database_url or not pepper:
+            self.memory_error = "memory_configuration_incomplete"
+            return
+        try:
+            store = MemoryStore.postgres(database_url=database_url, pepper=pepper)
+            store.migrate()
+            reader_token = os.environ.get("MEMORY_BOOTSTRAP_READER_TOKEN", "").strip()
+            writer_token = os.environ.get("MEMORY_BOOTSTRAP_WRITER_TOKEN", "").strip()
+            if reader_token or writer_token:
+                if not reader_token or not writer_token:
+                    self.memory_error = "memory_bootstrap_credentials_incomplete"
+                    return
+                store.bootstrap(reader_token, writer_token)
+            self.memory_store = store
+            readiness = store.readiness()
+            self.memory_ready = bool(readiness.get("ready"))
+            self.memory_error = "" if self.memory_ready else str(readiness.get("reason") or "memory_credentials_missing")
+        except Exception:
+            self.memory_store = None
+            self.memory_ready = False
+            self.memory_error = "memory_database_unavailable"
+
+    def record_memory_audit(self, event: dict) -> None:
+        allowed = {"tool", "status", "duration_ms", "revision", "history_item_id"}
+        safe_event = {key: event[key] for key in allowed if key in event and event[key] is not None}
+        safe_event["at"] = now_iso()
+        with self.memory_audit_lock:
+            self.memory_audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.memory_audit_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(safe_event, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     def _load_activity_events(self) -> list[dict]:
         try:
@@ -406,7 +468,14 @@ class Handler(BaseHTTPRequestHandler):
     state: State
 
     def log_message(self, fmt: str, *args) -> None:
-        sys.stderr.write("[linjian-unified] %s - %s\n" % (self.address_string(), fmt % args))
+        rendered = fmt % args
+        rendered = re.sub(
+            r"([?&](?:token|authorization|credential)=[^&\s]*)",
+            lambda match: match.group(0).split("=", 1)[0] + "=<redacted>",
+            rendered,
+            flags=re.IGNORECASE,
+        )
+        sys.stderr.write("[linjian-unified] %s - %s\n" % (self.address_string(), rendered))
 
     def _send_bytes(self, code: int, body: bytes, content_type: str) -> None:
         self.send_response(code)
@@ -435,6 +504,112 @@ class Handler(BaseHTTPRequestHandler):
         try: return json.loads(raw.decode("utf-8"))
         except Exception: return {}
 
+    def _read_memory_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length <= 0:
+            return {}
+        if length > MAX_MEMORY_REQUEST_BYTES:
+            raise MemoryValidationError("request_too_large")
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except Exception as exc:
+            raise MemoryValidationError("invalid_json") from exc
+        if not isinstance(payload, dict):
+            raise MemoryValidationError("json_object_required")
+        if any(key in payload for key in ("namespace", "namespace_id", "device_id")):
+            raise MemoryValidationError("namespace_not_allowed")
+        return payload
+
+    def _memory_token(self) -> str:
+        supplied = self.headers.get("X-Auth-Token", "").strip()
+        if supplied:
+            return supplied
+        authorization = self.headers.get("Authorization", "").strip()
+        if authorization.lower().startswith("bearer "):
+            return authorization[7:].strip()
+        return ""
+
+    def _memory_available(self) -> bool:
+        if not getattr(self.state, "memory_enabled", False):
+            self._json(404, {"ok": False, "error": "memory_disabled"})
+            return False
+        query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        if any(key in query for key in ("namespace", "namespace_id", "device_id")):
+            self._json(400, {"ok": False, "error": "namespace_not_allowed"})
+            return False
+        if not getattr(self.state, "memory_ready", False) or not getattr(self.state, "memory_store", None):
+            self._json(503, {"ok": False, "error": "memory_unavailable"})
+            return False
+        return True
+
+    def _memory_result(self, operation, success_code: int = 200, audit_tool: str = "") -> None:
+        if not self._memory_available():
+            return
+        started = time.monotonic()
+        try:
+            payload = operation(self.state.memory_store, self._memory_token())
+            self._json(success_code, {"ok": True, **payload})
+            self._memory_audit(audit_tool, "success", started, payload)
+        except MemoryAuthError as exc:
+            code = "insufficient_memory_scope" if str(exc) == "insufficient_memory_scope" else "invalid_memory_credential"
+            self._json(403, {"ok": False, "error": code})
+            self._memory_audit(audit_tool, "denied", started)
+        except MemoryValidationError as exc:
+            self._json(400, {"ok": False, "error": str(exc)})
+            self._memory_audit(audit_tool, "rejected", started)
+        except MemoryConflictError as exc:
+            allowed = {"revision_conflict", "history_already_revised", "history_not_active", "history_duplicate"}
+            code = str(exc) if str(exc) in allowed else "memory_conflict"
+            self._json(409, {"ok": False, "error": code})
+            self._memory_audit(audit_tool, "conflict", started)
+        except MemoryDatabaseError:
+            self._json(503, {"ok": False, "error": "memory_database_unavailable"})
+            self._memory_audit(audit_tool, "failed", started)
+        except Exception:
+            self._json(503, {"ok": False, "error": "memory_unavailable"})
+            self._memory_audit(audit_tool, "failed", started)
+
+    def _memory_audit(self, tool: str, status: str, started: float, payload: dict | None = None) -> None:
+        if not tool:
+            return
+        event = {"tool": tool, "status": status, "duration_ms": max(0, round((time.monotonic() - started) * 1000))}
+        if payload:
+            active = payload.get("active_memory") if isinstance(payload.get("active_memory"), dict) else payload
+            item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+            revision = active.get("revision") if isinstance(active, dict) else None
+            history_item_id = item.get("id")
+            if isinstance(revision, int):
+                event["revision"] = revision
+            if isinstance(history_item_id, str) and history_item_id:
+                event["history_item_id"] = history_item_id[:128]
+        try:
+            recorder = getattr(self.state, "record_memory_audit", None)
+            if callable(recorder):
+                recorder(event)
+        except Exception:
+            pass
+
+    def _memory_text_field(self, data: dict, name: str, limit: int, required: bool = False) -> str:
+        value = data.get(name)
+        if value is None and not required:
+            return ""
+        if not isinstance(value, str):
+            raise MemoryValidationError(f"{name}_must_be_string")
+        value = value.strip().replace("\x00", "")
+        if required and not value:
+            raise MemoryValidationError(f"{name}_required")
+        if len(value) > limit:
+            raise MemoryValidationError(f"{name}_too_long")
+        return value
+
+    def _memory_limit_field(self, data: dict, name: str, default: int = MAX_HISTORY_ITEMS) -> int:
+        value = data.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise MemoryValidationError(f"{name}_must_be_integer")
+        if value < 1 or value > MAX_HISTORY_ITEMS:
+            raise MemoryValidationError(f"{name}_out_of_range")
+        return value
+
 
     def _public_base(self) -> str:
         configured = os.environ.get("LINJIAN_PUBLIC_URL", "").strip().rstrip("/")
@@ -449,7 +624,7 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         qs = parse_qs(parsed.query)
         if path in ("/", "/health"):
-            self._json(200, {"ok": True, "service": "linjian-public", "name": "掌心窗", "version": VERSION, "tools": sorted(ALLOWED_ACTIONS), "guidian": True, "calendar": True, "diary": True, "diary_storage": "phone_local", "app_gate": True})
+            self._json(200, {"ok": True, "service": "linjian-public", "name": "掌心窗", "version": VERSION, "tools": sorted(ALLOWED_ACTIONS), "guidian": True, "calendar": True, "diary": True, "diary_storage": "phone_local", "app_gate": True, "memory_enabled": bool(getattr(self.state, "memory_enabled", False)), "memory_ready": bool(getattr(self.state, "memory_ready", False)), "memory_status": "ready" if getattr(self.state, "memory_ready", False) else (getattr(self.state, "memory_error", "") or "disabled")})
             return
         if path in ("/mcp", "/sse"):
             self._json(400, {"ok": False, "error": "LINJIAN_ERR_WRONG_SERVICE", "message": "你访问的是掌心窗 server 服务，不是 MCP 服务。请单独部署 mcp 目录，并在 MCP 客户端填写 MCP 服务域名 + /mcp 或 /sse。"})
@@ -465,6 +640,9 @@ class Handler(BaseHTTPRequestHandler):
             if unified:
                 actions = [{"id": e.get("id"), "at": e.get("created_at"), "created_at": e.get("created_at"), "kind": e.get("type"), "type": e.get("type"), "title": e.get("title"), "summary": e.get("subtitle"), "subtitle": e.get("subtitle"), "status": e.get("status"), "source": "companion"} for e in unified]
             self._json(200, {"ok": True, "whisper": whisper, "actions": actions}); return
+        if path == "/api/memory/active":
+            self._memory_result(lambda store, token: {"active_memory": store.get_active(token)})
+            return
         if path == "/api/activity/events":
             if not self._require_token(): return
             device_id = qs.get("device_id", [""])[0]
@@ -524,6 +702,39 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path in ("/mcp", "/sse"):
             self._json(400, {"ok": False, "error": "LINJIAN_ERR_WRONG_SERVICE", "message": "你访问的是掌心窗 server 服务，不是 MCP 服务。请单独部署 mcp 目录，并在 MCP 客户端填写 MCP 服务域名 + /mcp 或 /sse。"})
+            return
+        if path == "/api/memory/context":
+            def get_memory_context(store, token):
+                data = self._read_memory_json()
+                return store.get_context(
+                    token,
+                    query=self._memory_text_field(data, "query", MAX_QUERY_CHARS),
+                    history_limit=self._memory_limit_field(data, "history_limit"),
+                )
+            self._memory_result(get_memory_context)
+            return
+        if path == "/api/memory/search":
+            def search_memory(store, token):
+                data = self._read_memory_json()
+                return {"results": store.search(
+                    token,
+                    query=self._memory_text_field(data, "query", MAX_QUERY_CHARS, required=True),
+                    limit=self._memory_limit_field(data, "limit"),
+                )}
+            self._memory_result(search_memory)
+            return
+        if path == "/api/memory/history":
+            def append_memory(store, token):
+                data = self._read_memory_json()
+                return store.append_history(
+                    token,
+                    summary=self._memory_text_field(data, "summary", MAX_HISTORY_SUMMARY_CHARS, required=True),
+                    searchable_text=self._memory_text_field(data, "searchable_text", MAX_HISTORY_SEARCHABLE_CHARS),
+                    source=self._memory_text_field({"source": data.get("source", "chatgpt")}, "source", MAX_HISTORY_SOURCE_CHARS, required=True),
+                    occurred_at=data.get("occurred_at"),
+                    expires_at=data.get("expires_at"),
+                )
+            self._memory_result(append_memory, success_code=201, audit_tool="append_memory")
             return
         if path == "/api/companion/whisper":
             if not self._require_token(): return
@@ -616,6 +827,52 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/screenshot":
             if not self._require_token(): return
             self._handle_screenshot(); return
+        self._json(404, {"ok": False, "error": ERR_BAD_METHOD})
+
+    def do_PUT(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/api/memory/active":
+            def set_active_memory(store, token):
+                data = self._read_memory_json()
+                return {"active_memory": store.set_active(
+                    token,
+                    content=self._memory_text_field(data, "content", MAX_ACTIVE_CHARS, required=True),
+                    expected_revision=data.get("expected_revision"),
+                )}
+            self._memory_result(set_active_memory, audit_tool="set_active_memory")
+            return
+        self._json(404, {"ok": False, "error": ERR_BAD_METHOD})
+
+    def do_PATCH(self) -> None:
+        path = urlparse(self.path).path
+        prefix = "/api/memory/history/"
+        if path.startswith(prefix):
+            history_id = unquote(path[len(prefix):])
+            def revise_memory(store, token):
+                data = self._read_memory_json()
+                return store.revise_history(
+                    token,
+                    history_id=history_id,
+                    summary=self._memory_text_field(data, "summary", MAX_HISTORY_SUMMARY_CHARS, required=True),
+                    searchable_text=self._memory_text_field(data, "searchable_text", MAX_HISTORY_SEARCHABLE_CHARS),
+                    source=self._memory_text_field({"source": data.get("source", "chatgpt")}, "source", MAX_HISTORY_SOURCE_CHARS, required=True),
+                    occurred_at=data.get("occurred_at"),
+                    expires_at=data.get("expires_at"),
+                )
+            self._memory_result(revise_memory, audit_tool="revise_memory")
+            return
+        self._json(404, {"ok": False, "error": ERR_BAD_METHOD})
+
+    def do_DELETE(self) -> None:
+        path = urlparse(self.path).path
+        prefix = "/api/memory/history/"
+        if path.startswith(prefix):
+            history_id = unquote(path[len(prefix):])
+            self._memory_result(
+                lambda store, token: store.forget_history(token, history_id),
+                audit_tool="forget_memory",
+            )
+            return
         self._json(404, {"ok": False, "error": ERR_BAD_METHOD})
 
     def _queue(self, cmd: dict) -> None:

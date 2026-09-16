@@ -5,6 +5,7 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 import fs from "fs";
 import path from "path";
+import { MEMORY_TOOL_NAMES, registerMemoryTools } from "./memory-tools.js";
 
 const PORT = Number(process.env.PORT || 8787);
 const RAW_LINJIAN_URL = (process.env.LINJIAN_URL || "").trim();
@@ -49,6 +50,8 @@ function effectiveLinjianUrl() {
   return activeLinjianUrl || LINJIAN_URL_CANDIDATES[0] || "";
 }
 const LINJIAN_TOKEN = process.env.LINJIAN_TOKEN || "";
+const MEMORY_MCP_WRITER_TOKEN = process.env.MEMORY_MCP_WRITER_TOKEN || "";
+const MEMORY_MCP_TOOLS_ENABLED = /^(?:1|true|yes|on)$/i.test(process.env.MEMORY_MCP_TOOLS_ENABLED || "");
 const DEFAULT_DEVICE = process.env.LINJIAN_DEFAULT_DEVICE || "android-phone";
 
 // v0.3.6.6：公开 MCP 经常被平台限制在 20 秒内返回。
@@ -704,6 +707,33 @@ async function linjianFetch(path, options = {}) {
   throw new Error(`Linjian server fetch failed. tried=${errors.join(" | ")}`);
 }
 
+async function memoryFetch(path, options = {}) {
+  if (!MEMORY_MCP_WRITER_TOKEN) throw new Error("Shared memory is not configured");
+  const base = normalizeBaseUrl(RAW_LINJIAN_URL);
+  if (!base) throw new Error("Shared memory is not configured");
+  const { timeout_ms, ...fetchOptions } = options || {};
+  const timeoutMs = Math.max(500, Number(timeout_ms || DEFAULT_FETCH_TIMEOUT_MS));
+  try {
+    const response = await fetch(`${base}${path}`, {
+      ...fetchOptions,
+      signal: fetchOptions.signal || AbortSignal.timeout(timeoutMs),
+      headers: { ...(fetchOptions.headers || {}), "X-Auth-Token": MEMORY_MCP_WRITER_TOKEN },
+    });
+    if (!response.ok) throw new Error("Shared memory request failed");
+    return response;
+  } catch {
+    throw new Error("Shared memory request failed");
+  }
+}
+
+async function writeMemoryAudit(event = {}) {
+  const allowed = ["tool", "status", "duration_ms", "revision", "history_item_id"];
+  const safe = Object.fromEntries(allowed
+    .filter((key) => event[key] !== undefined && event[key] !== null)
+    .map((key) => [key, event[key]]));
+  console.info("[memory-audit]", JSON.stringify(safe));
+}
+
 async function postCommand(payload) {
   const res = await linjianFetch("/api/command", {
     method: "POST",
@@ -1011,11 +1041,12 @@ function makeServer() {
     "get_wallet_month_state", "add_wallet_record", "list_wallet_pending", "submit_wallet_approval", "submit_companion_wallet_request", "list_companion_wallet_requests", "list_wallet_request_results", "confirm_wallet_record",
     "decide_wallet_approval", "save_wallet_request_result", "update_wallet_request_result", "save_user_wallet_request_result", "edit_wallet_record", "delete_wallet_record", "set_wallet_rules", "wallet_approval_request", "get_takeout_state", "set_takeout_budget", "set_takeout_preferences", "add_takeout_card", "save_takeout_card", "update_takeout_card", "remove_takeout_card", "delete_takeout_card", "list_takeout_cards", "list_takeout_meals", "remember_takeout_meal", "remember_current_takeout_meal", "suggest_takeout_options", "create_takeout_plan", "takeout_wallet_request", "open_takeout_link", "open_takeout_plan", "copy_takeout_note", "record_takeout_order", "prepare_takeout_checkout", "auto_takeout_checkout", "get_takeout_checkout_status", "cancel_takeout_checkout"
   ]);
+  const memoryToolNames = new Set(MEMORY_TOOL_NAMES);
   const originalTool = server.tool.bind(server);
   server.tool = (...args) => {
     const toolName = String(args[0] || "");
     const callbackIndex = args.map((x) => typeof x).lastIndexOf("function");
-    if (callbackIndex >= 0 && toolName !== "get_activity_events" && toolName !== "add_activity_event" && !commandBackedTools.has(toolName)) {
+    if (callbackIndex >= 0 && toolName !== "get_activity_events" && toolName !== "add_activity_event" && !commandBackedTools.has(toolName) && !memoryToolNames.has(toolName)) {
       const callback = args[callbackIndex];
       args[callbackIndex] = async (...callArgs) => {
         try {
@@ -1034,6 +1065,7 @@ function makeServer() {
 
   // 把小金库/外卖统一入口放在普通 /mcp 的靠前位置，避免客户端只读取前若干个工具时漏掉新版能力。
   registerWalletTakeoutTools(server, { includeUnified: true });
+  registerMemoryTools(server, { enabled: MEMORY_MCP_TOOLS_ENABLED, fetchImpl: memoryFetch, audit: writeMemoryAudit });
 
   server.tool(
     "peek_screen",
@@ -2025,6 +2057,8 @@ app.get("/health", (_req, res) => res.json({
   guardian_day_tools: true,
   diary_tools: true,
   diary_storage: "phone_local",
+  memory_tools_enabled: MEMORY_MCP_TOOLS_ENABLED,
+  memory_tools_ready: MEMORY_MCP_TOOLS_ENABLED && Boolean(MEMORY_MCP_WRITER_TOKEN),
   mcp_wallet_endpoint: "/mcp-wallet",
   schema_exposure_fix: true,
   priority_tool: "wallet_takeout_action",

@@ -1,1 +1,2 @@
-# 掌心窗公开版 server 使用 Python 标准库，无需第三方依赖。
+# PostgreSQL shared memory. The legacy server remains disabled-by-default.
+psycopg[binary]>=3.2,<4
