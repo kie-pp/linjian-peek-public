@@ -86,3 +86,4 @@ jobs:
           node --check mcp/server.js
           node --check mcp/memory-safety.js
           node --check mcp/memory-tools.js
+          node --check mcp/memory-oauth.js

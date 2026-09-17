@@ -4,9 +4,12 @@ import { assertSafeMemoryContent } from "./memory-safety.js";
 const PRIVATE_KEYS = /(?:namespace|credential|token|authorization|digest)/i;
 const POLICY = "共享记忆只保存 ChatGPT 与 Cyberboss 都需要知道的精炼事实；不替代 ChatGPT 小本本、Cyberboss 世界书或当前 thread，默认不得保存原始聊天。";
 
-export function registerMemoryTools(server, { enabled = false, fetchImpl, audit = async () => {} } = {}) {
+export function registerMemoryTools(server, { enabled = false, scopes = [], fetchImpl, audit = async () => {} } = {}) {
   if (!enabled) return [];
   if (typeof fetchImpl !== "function") throw new Error("Memory client is unavailable");
+  const grantedScopes = new Set(scopes || []);
+  if (!grantedScopes.has("memory:read")) return [];
+  const canWrite = grantedScopes.has("memory:write");
 
   const registered = [];
   const add = (name, description, schema, callback) => {
@@ -41,15 +44,17 @@ export function registerMemoryTools(server, { enabled = false, fetchImpl, audit 
     async ({ query, limit = 3 }) => callJson(fetchImpl, "/api/memory/search", "POST", { query, limit }),
   );
 
-  add(
-    "set_active_memory",
-    "更新当前共享 active memory。可提供 expected_revision 防止覆盖并发修改。",
-    { content: z.string().min(1).max(600), expected_revision: z.number().int().nonnegative().optional() },
-    async ({ content, expected_revision }) => {
-      assertSafeMemoryContent(content);
-      return callJson(fetchImpl, "/api/memory/active", "PUT", compact({ content, expected_revision }));
-    },
-  );
+  if (canWrite) {
+    add(
+      "set_active_memory",
+      "更新当前共享 active memory。可提供 expected_revision 防止覆盖并发修改。",
+      { content: z.string().min(1).max(600), expected_revision: z.number().int().nonnegative().optional() },
+      async ({ content, expected_revision }) => {
+        assertSafeMemoryContent(content);
+        return callJson(fetchImpl, "/api/memory/active", "PUT", compact({ content, expected_revision }));
+      },
+    );
+  }
 
   const historySchema = {
     summary: z.string().min(1).max(600),
@@ -59,7 +64,7 @@ export function registerMemoryTools(server, { enabled = false, fetchImpl, audit 
     expires_at: z.string().max(40).optional(),
   };
 
-  add(
+  if (canWrite) add(
     "append_memory",
     "向当前共享用户空间追加一条去重历史记忆。",
     historySchema,
@@ -69,7 +74,7 @@ export function registerMemoryTools(server, { enabled = false, fetchImpl, audit 
     },
   );
 
-  add(
+  if (canWrite) add(
     "revise_memory",
     "修订一条共享历史记忆：新增后继记录并保留修订关系，不覆盖旧正文。",
     { history_id: z.string().min(1).max(128), ...historySchema },
@@ -79,9 +84,9 @@ export function registerMemoryTools(server, { enabled = false, fetchImpl, audit 
     },
   );
 
-  add(
+  if (canWrite) add(
     "forget_memory",
-    "软删除一条共享历史记忆；删除后默认不再参与检索和上下文。",
+    "忘记一条共享历史记忆：清空整条修订链的正文和搜索文本；若 active memory 无法可靠自动定位会返回需人工修订。数据库备份仍可能在其保留期内存在。",
     { history_id: z.string().min(1).max(128) },
     async ({ history_id }) => callJson(fetchImpl, `/api/memory/history/${encodeURIComponent(history_id)}`, "DELETE"),
   );

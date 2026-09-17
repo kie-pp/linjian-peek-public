@@ -11,6 +11,7 @@ from memory_store import (
     MemoryConflictError,
     MemoryStore,
     MemoryValidationError,
+    _purge_active_content,
     digest_credential,
     _credential_readiness,
 )
@@ -20,6 +21,7 @@ class LifecycleRepository:
     def __init__(self):
         self.credentials = {}
         self.history = {}
+        self.active = {}
         self._lock = threading.Lock()
 
     def bootstrap_credentials(self, reader_digest, writer_digest):
@@ -39,8 +41,8 @@ class LifecycleRepository:
     def resolve_credential(self, credential_digest):
         return copy.deepcopy(self.credentials.get(credential_digest))
 
-    def get_active(self, _namespace_id):
-        return None
+    def get_active(self, namespace_id):
+        return copy.deepcopy(self.active.get(namespace_id))
 
     def credential_readiness(self):
         active = [item for item in self.credentials.values() if item["status"] == "active"]
@@ -112,11 +114,31 @@ class LifecycleRepository:
             row = next((item for item in bucket if item["id"] == history_id), None)
             if not row:
                 raise MemoryValidationError("history_not_found")
-            changed = row["status"] != "deleted"
-            if changed:
-                row["status"] = "deleted"
-                row["deleted_at"] = datetime.now(timezone.utc)
-            return copy.deepcopy(row), changed
+            chain_ids = {history_id}
+            changed_chain = True
+            while changed_chain:
+                before = len(chain_ids)
+                for item in bucket:
+                    if item["id"] in chain_ids or item.get("supersedes_id") in chain_ids:
+                        chain_ids.add(item["id"])
+                        if item.get("supersedes_id"):
+                            chain_ids.add(item["supersedes_id"])
+                changed_chain = len(chain_ids) != before
+            chain = [item for item in bucket if item["id"] in chain_ids]
+            changed = any(item["status"] != "deleted" or item["summary"] or item["searchable_text"] for item in chain)
+            for item in chain:
+                item["summary"] = ""
+                item["searchable_text"] = ""
+                item["source"] = "forgotten"
+                item["status"] = "deleted"
+                item["deleted_at"] = item.get("deleted_at") or datetime.now(timezone.utc)
+            return {
+                "id": history_id,
+                "changed": changed,
+                "purged_records": len(chain),
+                "active_memory_status": "not_present",
+                "active_revision": 0,
+            }
 
     def recent_history(self, namespace_id, limit):
         now = datetime.now(timezone.utc)
@@ -191,14 +213,16 @@ class MemoryHardeningTests(unittest.TestCase):
         visible = self.store.search(self.reader, "称呼")
         self.assertEqual([item["summary"] for item in visible], ["新称呼"])
 
-    def test_forget_is_soft_idempotent_and_namespace_isolated(self):
+    def test_forget_purges_body_and_is_idempotent_and_namespace_isolated(self):
         first = self.store.append_history(self.writer, "需要忘记的事实")
         history_id = first["item"]["id"]
         forgotten = self.store.forget_history(self.writer, history_id)
         repeated = self.store.forget_history(self.writer, history_id)
         self.assertTrue(forgotten["deleted"])
         self.assertFalse(repeated["changed"])
-        self.assertEqual(self.repo.history[self.namespace_id][0]["summary"], "需要忘记的事实")
+        self.assertEqual(self.repo.history[self.namespace_id][0]["summary"], "")
+        self.assertEqual(self.repo.history[self.namespace_id][0]["searchable_text"], "")
+        self.assertEqual(forgotten["active_memory_status"], "not_present")
         self.assertEqual(self.store.get_context(self.reader)["relevant_history"], [])
 
         other_writer = "other-writer"
@@ -207,6 +231,17 @@ class MemoryHardeningTests(unittest.TestCase):
         }
         with self.assertRaises(MemoryValidationError):
             self.store.forget_history(other_writer, history_id)
+
+    def test_active_memory_exact_fact_is_removed_and_ambiguous_content_requires_manual_revision(self):
+        content = "称呼是培培。需要忘记的事实。项目继续推进。"
+        purged, matched = _purge_active_content(content, ["需要忘记的事实", ""])
+        self.assertTrue(matched)
+        self.assertNotIn("需要忘记的事实", purged)
+        self.assertIn("项目继续推进", purged)
+
+        unchanged, matched = _purge_active_content("她更喜欢简短回复。", ["回复要短"])
+        self.assertFalse(matched)
+        self.assertEqual(unchanged, "她更喜欢简短回复。")
 
     def test_expired_history_is_not_returned(self):
         self.store.append_history(

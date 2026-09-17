@@ -29,6 +29,7 @@ test("enabled memory tools register seven namespace-free operations", async () =
   const requests = [];
   registerMemoryTools(server, {
     enabled: true,
+    scopes: ["memory:read", "memory:write"],
     fetchImpl: async (path, options) => {
       requests.push({ path, options });
       return response(path.endsWith("/history") ? { created: true, item: { id: "history-1" } } : { active_memory: "memory", relevant_history: [] });
@@ -66,10 +67,29 @@ test("enabled memory tools register seven namespace-free operations", async () =
   assert.ok(requests.every(({ options }) => !String(options.body || "").includes("namespace")));
 });
 
+test("reader scope registers only the three read tools and unauthenticated scope registers none", () => {
+  const reader = fakeMcpServer();
+  registerMemoryTools(reader, {
+    enabled: true,
+    scopes: ["memory:read"],
+    fetchImpl: async () => response({}),
+  });
+  assert.deepEqual([...reader.tools.keys()], ["get_memory_context", "get_active_memory", "search_memory"]);
+
+  const unauthenticated = fakeMcpServer();
+  registerMemoryTools(unauthenticated, {
+    enabled: true,
+    scopes: [],
+    fetchImpl: async () => response({}),
+  });
+  assert.equal(unauthenticated.tools.size, 0);
+});
+
 test("memory audit failure never changes a successful operation", async () => {
   const server = fakeMcpServer();
   registerMemoryTools(server, {
     enabled: true,
+    scopes: ["memory:read", "memory:write"],
     fetchImpl: async () => response({ active_memory: { revision: 4 } }),
     audit: async () => { throw new Error("audit unavailable"); },
   });
@@ -82,6 +102,7 @@ test("memory audit contains only approved metadata", async () => {
   const events = [];
   registerMemoryTools(server, {
     enabled: true,
+    scopes: ["memory:read", "memory:write"],
     fetchImpl: async () => response({ created: true, item: { id: "history-9", summary: "secret body" } }),
     audit: async (event) => events.push(event),
   });
@@ -96,6 +117,7 @@ test("writer tools reject sensitive content before any request", async () => {
   let requestCount = 0;
   registerMemoryTools(server, {
     enabled: true,
+    scopes: ["memory:read", "memory:write"],
     fetchImpl: async () => { requestCount += 1; return response({}); },
   });
   await assert.rejects(
@@ -115,6 +137,7 @@ test("writer safety permits normal links and relationship preferences", async ()
   let requestCount = 0;
   registerMemoryTools(server, {
     enabled: true,
+    scopes: ["memory:read", "memory:write"],
     fetchImpl: async () => { requestCount += 1; return response({ created: true, item: { id: "normal" } }); },
   });
   await server.tools.get("append_memory").callback({
@@ -129,6 +152,7 @@ test("tool responses and errors do not expose credentials or internal namespaces
   const secret = "writer-secret-test-value";
   registerMemoryTools(server, {
     enabled: true,
+    scopes: ["memory:read", "memory:write"],
     fetchImpl: async () => response({ active_memory: "safe", namespace_id: "must-not-leak", token: secret }),
   });
   const result = await server.tools.get("get_active_memory").callback({});
@@ -151,4 +175,13 @@ test("memory tools bypass the legacy activity wrapper", () => {
   const source = readFileSync(new URL("../server.js", import.meta.url), "utf8");
   assert.match(source, /memoryToolNames\.has\(toolName\)/);
   assert.match(source, /registerMemoryTools\(server, \{[^}]*audit: writeMemoryAudit/);
+});
+
+test("the public MCP never registers memory tools and the protected endpoint authenticates first", () => {
+  const source = readFileSync(new URL("../server.js", import.meta.url), "utf8");
+  const publicFactory = source.slice(source.indexOf("function makeServer()"), source.indexOf("const app = express()"));
+  assert.doesNotMatch(publicFactory, /registerMemoryTools\(/);
+  assert.match(source, /app\.post\("\/mcp-memory"/);
+  assert.match(source, /authInfo = await memoryOAuth\.authenticate\(req\.headers\)/);
+  assert.match(source, /function makeMemoryServer\(authInfo\)/);
 });

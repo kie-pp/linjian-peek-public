@@ -53,7 +53,10 @@ class FakeMemoryStore:
 
     def forget_history(self, token, history_id):
         self._check(token, write=True)
-        return {"deleted": True, "changed": True, "item": {"id": history_id, "status": "deleted"}}
+        return {"deleted": True, "changed": True, "purged_records": 1,
+                "active_memory_status": "manual_revision_required",
+                "requires_manual_active_revision": True,
+                "item": {"id": history_id, "status": "deleted"}}
 
 
 class FakeState:

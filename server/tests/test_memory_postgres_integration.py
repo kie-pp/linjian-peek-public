@@ -114,28 +114,38 @@ class PostgresMemoryIntegrationTests(unittest.TestCase):
         with self.assertRaises(MemoryAuthError):
             self.store.append_history(other_token, "denied")
 
-    def test_revision_soft_delete_and_expiry_filtering(self):
+    def test_revision_forget_purges_chain_active_and_expiry_filtering(self):
         first = self.store.append_history(self.writer, "旧偏好", "偏好", source="chatgpt")
         revised = self.store.revise_history(self.writer, first["item"]["id"], "新偏好", "偏好", source="chatgpt")
         repeated = self.store.revise_history(self.writer, first["item"]["id"], "新偏好", "偏好", source="chatgpt")
         self.assertTrue(revised["created"])
         self.assertFalse(repeated["created"])
         self.assertEqual([row["summary"] for row in self.store.search(self.reader, "偏好")], ["新偏好"])
-        self.assertTrue(self.store.forget_history(self.writer, revised["item"]["id"])["changed"])
+        self.store.set_active(self.writer, "当前项目。新偏好。其他事实。", expected_revision=0)
+        forgotten = self.store.forget_history(self.writer, revised["item"]["id"])
+        self.assertTrue(forgotten["changed"])
+        self.assertEqual(forgotten["purged_records"], 2)
+        self.assertEqual(forgotten["active_memory_status"], "purged_exact_match")
         self.assertFalse(self.store.forget_history(self.writer, revised["item"]["id"])["changed"])
         with self.repository._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT status, summary, searchable_text, deleted_at "
-                    "FROM memory_history WHERE namespace_id = %s AND id = %s",
-                    (self.namespace_id, revised["item"]["id"]),
+                    "SELECT id, status, summary, searchable_text, source, content_hash, deleted_at "
+                    "FROM memory_history WHERE namespace_id = %s AND id = ANY(%s) ORDER BY id",
+                    (self.namespace_id, [first["item"]["id"], revised["item"]["id"]]),
                 )
-                forgotten_row = cursor.fetchone()
-        self.assertEqual(forgotten_row[0], "deleted")
-        self.assertEqual(forgotten_row[1], "新偏好")
-        self.assertEqual(forgotten_row[2], "偏好")
-        self.assertIsNotNone(forgotten_row[3])
+                forgotten_rows = cursor.fetchall()
+        self.assertEqual(len(forgotten_rows), 2)
+        for row in forgotten_rows:
+            self.assertEqual(row[1], "deleted")
+            self.assertEqual(row[2], "")
+            self.assertEqual(row[3], "")
+            self.assertEqual(row[4], "forgotten")
+            self.assertRegex(row[5], r"^[0-9a-f]{64}$")
+            self.assertIsNotNone(row[6])
         self.assertEqual(self.store.search(self.reader, "偏好"), [])
+        self.assertNotIn("新偏好", repr(self.store.get_context(self.reader)))
+        self.assertNotIn("新偏好", repr(self.store.get_active(self.reader)))
         self.store.append_history(
             self.writer,
             "已过期状态",

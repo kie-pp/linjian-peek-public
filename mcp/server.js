@@ -6,6 +6,7 @@ import { z } from "zod";
 import fs from "fs";
 import path from "path";
 import { MEMORY_TOOL_NAMES, registerMemoryTools } from "./memory-tools.js";
+import { MemoryOAuthError, createMemoryOAuthFromEnv } from "./memory-oauth.js";
 
 const PORT = Number(process.env.PORT || 8787);
 const RAW_LINJIAN_URL = (process.env.LINJIAN_URL || "").trim();
@@ -52,7 +53,19 @@ function effectiveLinjianUrl() {
 const LINJIAN_TOKEN = process.env.LINJIAN_TOKEN || "";
 const MEMORY_MCP_WRITER_TOKEN = process.env.MEMORY_MCP_WRITER_TOKEN || "";
 const MEMORY_MCP_TOOLS_ENABLED = /^(?:1|true|yes|on)$/i.test(process.env.MEMORY_MCP_TOOLS_ENABLED || "");
+const MEMORY_MCP_ENDPOINT_ENABLED = /^(?:1|true|yes|on)$/i.test(process.env.MEMORY_MCP_ENDPOINT_ENABLED || "");
 const DEFAULT_DEVICE = process.env.LINJIAN_DEFAULT_DEVICE || "android-phone";
+
+let memoryOAuth = null;
+let memoryOAuthConfigError = false;
+if (MEMORY_MCP_ENDPOINT_ENABLED && MEMORY_MCP_TOOLS_ENABLED) {
+  try {
+    memoryOAuth = createMemoryOAuthFromEnv(process.env);
+  } catch (error) {
+    if (!(error instanceof MemoryOAuthError)) throw error;
+    memoryOAuthConfigError = true;
+  }
+}
 
 // v0.3.6.6：公开 MCP 经常被平台限制在 20 秒内返回。
 // 状态读取、活动记录和命令轮询都要快速失败，避免整条工具链被 Render 冷启动、网络抖动或手机端确认弹窗拖到超时。
@@ -1028,6 +1041,17 @@ function makeWalletTakeoutServer() {
   return server;
 }
 
+function makeMemoryServer(authInfo) {
+  const server = new McpServer({ name: "掌心窗共享记忆", version: "0.3.7.9" });
+  registerMemoryTools(server, {
+    enabled: true,
+    scopes: authInfo?.scopes || [],
+    fetchImpl: memoryFetch,
+    audit: writeMemoryAudit,
+  });
+  return server;
+}
+
 function makeServer() {
   const server = new McpServer({ name: "掌心窗", version: "0.3.7.9" });
   const commandBackedTools = new Set([
@@ -1065,8 +1089,6 @@ function makeServer() {
 
   // 把小金库/外卖统一入口放在普通 /mcp 的靠前位置，避免客户端只读取前若干个工具时漏掉新版能力。
   registerWalletTakeoutTools(server, { includeUnified: true });
-  registerMemoryTools(server, { enabled: MEMORY_MCP_TOOLS_ENABLED, fetchImpl: memoryFetch, audit: writeMemoryAudit });
-
   server.tool(
     "peek_screen",
     "向掌心窗手机端请求一张新截图，并等待手机上传后把图片返回。当用户提到页面、按钮、红点、报错弹窗、截图、看不清或“陪伴对象看看这里”时应主动使用；手机端必须已启动、无障碍截图权限已开启。",
@@ -2057,8 +2079,12 @@ app.get("/health", (_req, res) => res.json({
   guardian_day_tools: true,
   diary_tools: true,
   diary_storage: "phone_local",
-  memory_tools_enabled: MEMORY_MCP_TOOLS_ENABLED,
-  memory_tools_ready: MEMORY_MCP_TOOLS_ENABLED && Boolean(MEMORY_MCP_WRITER_TOKEN),
+  memory_tools_enabled: false,
+  memory_tools_ready: false,
+  memory_mcp_endpoint_enabled: MEMORY_MCP_ENDPOINT_ENABLED,
+  memory_mcp_oauth_ready: Boolean(memoryOAuth) && !memoryOAuthConfigError,
+  memory_mcp_tools_ready: MEMORY_MCP_ENDPOINT_ENABLED && MEMORY_MCP_TOOLS_ENABLED && Boolean(memoryOAuth) && Boolean(MEMORY_MCP_WRITER_TOKEN),
+  memory_mcp_endpoint: "/mcp-memory",
   mcp_wallet_endpoint: "/mcp-wallet",
   schema_exposure_fix: true,
   priority_tool: "wallet_takeout_action",
@@ -2071,6 +2097,56 @@ app.post("/mcp", async (req, res) => {
   catch (err) { console.error(err); if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: String(err?.message || err) }, id: null }); }
 });
 app.get("/mcp", (_req, res) => res.status(405).json({ ok: false, error: "Use POST /mcp for Streamable HTTP MCP." }));
+app.get("/.well-known/oauth-protected-resource/mcp-memory", (_req, res) => {
+  if (!MEMORY_MCP_ENDPOINT_ENABLED || !MEMORY_MCP_TOOLS_ENABLED || !memoryOAuth) {
+    return res.status(404).json({ ok: false, error: "memory_mcp_not_enabled" });
+  }
+  return res.json(memoryOAuth.metadata());
+});
+app.post("/mcp-memory", async (req, res) => {
+  if (!MEMORY_MCP_ENDPOINT_ENABLED || !MEMORY_MCP_TOOLS_ENABLED) {
+    return res.status(404).json({ ok: false, error: "memory_mcp_not_enabled" });
+  }
+  if (!memoryOAuth || memoryOAuthConfigError || !MEMORY_MCP_WRITER_TOKEN) {
+    return res.status(503).json({ ok: false, error: "memory_mcp_not_ready" });
+  }
+  let authInfo;
+  try {
+    authInfo = await memoryOAuth.authenticate(req.headers);
+  } catch (error) {
+    if (error instanceof MemoryOAuthError) {
+      const insufficient = error.code === "memory_oauth_insufficient_scope";
+      res.setHeader("WWW-Authenticate", memoryOAuth.challenge(insufficient ? "insufficient_scope" : ""));
+      return res.status(error.status).json({ ok: false, error: error.code });
+    }
+    return res.status(401).json({ ok: false, error: "memory_oauth_invalid_token" });
+  }
+  try {
+    const server = makeMemoryServer(authInfo);
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    res.on("close", () => transport.close());
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch {
+    if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Memory MCP request failed" }, id: null });
+  }
+});
+app.get("/mcp-memory", async (req, res) => {
+  if (!MEMORY_MCP_ENDPOINT_ENABLED || !MEMORY_MCP_TOOLS_ENABLED || !memoryOAuth || !MEMORY_MCP_WRITER_TOKEN) {
+    return res.status(404).json({ ok: false, error: "memory_mcp_not_enabled" });
+  }
+  try {
+    await memoryOAuth.authenticate(req.headers);
+  } catch (error) {
+    if (error instanceof MemoryOAuthError) {
+      const insufficient = error.code === "memory_oauth_insufficient_scope";
+      res.setHeader("WWW-Authenticate", memoryOAuth.challenge(insufficient ? "insufficient_scope" : ""));
+      return res.status(error.status).json({ ok: false, error: error.code });
+    }
+    return res.status(401).json({ ok: false, error: "memory_oauth_invalid_token" });
+  }
+  return res.status(405).json({ ok: false, error: "Use POST /mcp-memory for authenticated Streamable HTTP MCP." });
+});
 app.post("/mcp-wallet", async (req, res) => {
   try { const server = makeWalletTakeoutServer(); const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }); res.on("close", () => transport.close()); await server.connect(transport); await transport.handleRequest(req, res, req.body); }
   catch (err) { console.error(err); if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: String(err?.message || err) }, id: null }); }

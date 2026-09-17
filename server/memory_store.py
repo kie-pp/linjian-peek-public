@@ -312,31 +312,75 @@ class PostgresRepository:
                 cursor.execute("UPDATE memory_namespaces SET updated_at = NOW() WHERE namespace_id = %s", (namespace_id,))
         return _history_row(row), True
 
-    def forget_history(self, namespace_id: str, history_id: str) -> tuple[dict, bool]:
+    def forget_history(self, namespace_id: str, history_id: str) -> dict:
         with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"linjian-history:{namespace_id}:{history_id}",))
                 cursor.execute(
-                    """SELECT id, summary, searchable_text, source, occurred_at, created_at,
-                              status, supersedes_id, expires_at, deleted_at
-                       FROM memory_history WHERE namespace_id = %s AND id = %s FOR UPDATE""",
-                    (namespace_id, history_id),
+                    """WITH RECURSIVE chain(id, supersedes_id) AS (
+                         SELECT id, supersedes_id
+                           FROM memory_history
+                          WHERE namespace_id = %s AND id = %s
+                         UNION
+                         SELECT item.id, item.supersedes_id
+                           FROM memory_history item
+                           JOIN chain linked
+                             ON item.namespace_id = %s
+                            AND (item.id = linked.supersedes_id OR item.supersedes_id = linked.id)
+                       )
+                       SELECT id, summary, searchable_text, status
+                         FROM memory_history
+                        WHERE namespace_id = %s AND id IN (SELECT id FROM chain)
+                        FOR UPDATE""",
+                    (namespace_id, history_id, namespace_id, namespace_id),
                 )
-                row = cursor.fetchone()
-                if not row:
+                rows = cursor.fetchall()
+                if not rows:
                     raise MemoryValidationError("history_not_found")
-                changed = row[6] != "deleted"
-                if changed:
+                changed = any(row[1] or row[2] or row[3] != "deleted" for row in rows)
+                summaries = [row[1] for row in rows if row[1]]
+                chain_ids = [row[0] for row in rows]
+                for chain_id in chain_ids:
+                    forgotten_hash = hashlib.sha256(f"forgotten:{chain_id}".encode("utf-8")).hexdigest()
                     cursor.execute(
-                        """UPDATE memory_history SET status = 'deleted', deleted_at = NOW()
-                           WHERE namespace_id = %s AND id = %s
-                           RETURNING id, summary, searchable_text, source, occurred_at, created_at,
-                                     status, supersedes_id, expires_at, deleted_at""",
-                        (namespace_id, history_id),
+                        """UPDATE memory_history
+                              SET summary = '', searchable_text = '', source = 'forgotten',
+                                  content_hash = %s, status = 'deleted',
+                                  deleted_at = COALESCE(deleted_at, NOW())
+                            WHERE namespace_id = %s AND id = %s""",
+                        (forgotten_hash, namespace_id, chain_id),
                     )
-                    row = cursor.fetchone()
+
+                cursor.execute(
+                    "SELECT content, revision FROM active_memory WHERE namespace_id = %s FOR UPDATE",
+                    (namespace_id,),
+                )
+                active = cursor.fetchone()
+                active_status = "not_present"
+                active_revision = int(active[1]) if active else 0
+                if active and active[0]:
+                    purged_content, matched = _purge_active_content(active[0], summaries)
+                    if matched:
+                        active_revision += 1
+                        cursor.execute(
+                            """UPDATE active_memory
+                                  SET content = %s, revision = %s, content_hash = %s, updated_at = NOW()
+                                WHERE namespace_id = %s""",
+                            (purged_content, active_revision,
+                             hashlib.sha256(purged_content.encode("utf-8")).hexdigest(), namespace_id),
+                        )
+                        active_status = "purged_exact_match"
+                    else:
+                        active_status = "manual_revision_required"
+                if changed or active_status == "purged_exact_match":
                     cursor.execute("UPDATE memory_namespaces SET updated_at = NOW() WHERE namespace_id = %s", (namespace_id,))
-        return _history_row(row), changed
+        return {
+            "id": history_id,
+            "changed": changed,
+            "purged_records": len(chain_ids),
+            "active_memory_status": active_status,
+            "active_revision": active_revision,
+        }
 
     def recent_history(self, namespace_id: str, limit: int) -> list[dict]:
         with self._connect() as connection:
@@ -430,10 +474,17 @@ class MemoryStore:
 
     def forget_history(self, token: str, history_id: str) -> dict:
         namespace_id = self.authenticate(token, "memory:write")
-        stored, changed = self._database_call(self.repository.forget_history, namespace_id, _history_id(history_id))
-        return {"deleted": True, "changed": changed, "item": {
-            "id": str(stored.get("id") or ""), "status": "deleted", "deleted_at": _iso(stored.get("deleted_at")),
-        }}
+        result = self._database_call(self.repository.forget_history, namespace_id, _history_id(history_id))
+        active_status = str(result.get("active_memory_status") or "manual_revision_required")
+        return {
+            "deleted": True,
+            "changed": bool(result.get("changed")),
+            "purged_records": int(result.get("purged_records") or 0),
+            "active_memory_status": active_status,
+            "requires_manual_active_revision": active_status == "manual_revision_required",
+            "active_revision": int(result.get("active_revision") or 0),
+            "item": {"id": str(result.get("id") or ""), "status": "deleted"},
+        }
 
     def rotate_credential(self, old_token: str, new_token: str, scopes: list[str], disable_old: bool = True) -> None:
         allowed_scopes = {"memory:read", "memory:write"}
@@ -499,6 +550,23 @@ def _public_active(item: dict | None) -> dict:
         return {"content": "", "revision": 0, "updated_at": None}
     return {"content": str(item.get("content") or "")[:MAX_ACTIVE_CHARS],
             "revision": int(item.get("revision") or 0), "updated_at": _iso(item.get("updated_at"))}
+
+
+def _purge_active_content(content: str, forgotten_summaries: list[str]) -> tuple[str, bool]:
+    """Remove only exact remembered statements; paraphrases require manual revision."""
+    purged = str(content or "")
+    matched = False
+    summaries = sorted({str(value).strip() for value in forgotten_summaries if str(value).strip()}, key=len, reverse=True)
+    for summary in summaries:
+        if summary in purged:
+            purged = purged.replace(summary, "")
+            matched = True
+    if not matched:
+        return purged, False
+    purged = re.sub(r"[。！？；，、]{2,}", lambda match: match.group(0)[-1], purged)
+    purged = re.sub(r"(?m)^[\s。！？；，、]+$", "", purged)
+    purged = re.sub(r"\n{3,}", "\n\n", purged)
+    return purged.strip(" \t\r\n。；，、"), True
 
 
 def _public_history(item: dict) -> dict:
