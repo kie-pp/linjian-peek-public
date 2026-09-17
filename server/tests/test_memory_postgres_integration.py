@@ -65,6 +65,12 @@ class PostgresMemoryIntegrationTests(unittest.TestCase):
             with connection.cursor() as cursor:
                 cursor.execute(cls.sql.SQL("DROP SCHEMA {} CASCADE").format(cls.sql.Identifier(cls.schema_name)))
 
+    def setUp(self):
+        with self.repository._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM memory_history WHERE namespace_id = %s", (self.namespace_id,))
+                cursor.execute("DELETE FROM active_memory WHERE namespace_id = %s", (self.namespace_id,))
+
     def test_migrations_multistatement_bootstrap_and_readiness(self):
         # Re-running both migrations must be a no-op and must not duplicate
         # migration bookkeeping after bootstrap has already completed.
