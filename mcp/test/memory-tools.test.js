@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
 
-import { registerMemoryTools } from "../memory-tools.js";
+import { installMemoryToolListContract, registerMemoryTools } from "../memory-tools.js";
 
 function fakeMcpServer() {
   const tools = new Map();
@@ -10,6 +13,9 @@ function fakeMcpServer() {
     tools,
     tool(name, description, schema, callback) {
       tools.set(name, { description, schema, callback });
+    },
+    registerTool(name, config, callback) {
+      tools.set(name, { ...config, schema: config.inputSchema, callback });
     },
   };
 }
@@ -83,6 +89,61 @@ test("reader scope registers only the three read tools and unauthenticated scope
     fetchImpl: async () => response({}),
   });
   assert.equal(unauthenticated.tools.size, 0);
+});
+
+test("every memory tool declares exact OAuth scopes in the descriptor and compatibility metadata", () => {
+  const server = fakeMcpServer();
+  registerMemoryTools(server, {
+    enabled: true,
+    scopes: ["memory:read", "memory:write"],
+    fetchImpl: async () => response({}),
+  });
+
+  for (const [name, tool] of server.tools) {
+    const scopes = name.startsWith("get_") || name === "search_memory"
+      ? ["memory:read"]
+      : ["memory:read", "memory:write"];
+    const expected = [{ type: "oauth2", scopes }];
+    assert.deepEqual(tool.securitySchemes, expected, `${name} top-level securitySchemes`);
+    assert.deepEqual(tool._meta?.securitySchemes, expected, `${name} compatibility securitySchemes`);
+  }
+});
+
+test("real MCP tools/list exposes top-level and compatibility OAuth security schemes", async () => {
+  const server = new McpServer({ name: "memory-test", version: "1.0.0" });
+  registerMemoryTools(server, {
+    enabled: true,
+    scopes: ["memory:read", "memory:write"],
+    fetchImpl: async () => response({}),
+  });
+  installMemoryToolListContract(server);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const pending = new Map();
+  clientTransport.onmessage = (message) => pending.get(message.id)?.(message);
+  await Promise.all([server.connect(serverTransport), clientTransport.start()]);
+  const request = async (id, method, params = {}) => {
+    const response = new Promise((resolve) => pending.set(id, resolve));
+    await clientTransport.send({ jsonrpc: "2.0", id, method, params });
+    return response;
+  };
+  try {
+    await request(1, "initialize", {
+      protocolVersion: LATEST_PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: "contract-test", version: "1.0.0" },
+    });
+    await clientTransport.send({ jsonrpc: "2.0", method: "notifications/initialized", params: {} });
+    const response = await request(2, "tools/list");
+    const tools = response.result.tools;
+    assert.equal(tools.length, 7);
+    for (const tool of tools) {
+      assert.deepEqual(tool.securitySchemes, tool._meta?.securitySchemes, tool.name);
+      assert.equal(tool.securitySchemes[0].type, "oauth2");
+    }
+  } finally {
+    await clientTransport.close();
+    await server.close();
+  }
 });
 
 test("memory audit failure never changes a successful operation", async () => {
@@ -179,9 +240,12 @@ test("memory tools bypass the legacy activity wrapper", () => {
 
 test("the public MCP never registers memory tools and the protected endpoint authenticates first", () => {
   const source = readFileSync(new URL("../server.js", import.meta.url), "utf8");
+  const routerSource = readFileSync(new URL("../memory-mcp-router.js", import.meta.url), "utf8");
   const publicFactory = source.slice(source.indexOf("function makeServer()"), source.indexOf("const app = express()"));
   assert.doesNotMatch(publicFactory, /registerMemoryTools\(/);
-  assert.match(source, /app\.post\("\/mcp-memory"/);
-  assert.match(source, /authInfo = await memoryOAuth\.authenticate\(req\.headers\)/);
+  assert.match(source, /app\.use\(createMemoryMcpRouter\(/);
+  assert.match(routerSource, /router\.post\("\/mcp-memory"/);
+  assert.match(routerSource, /await oauth\.validateProvider\(\)/);
+  assert.match(routerSource, /return await oauth\.authenticate\(req\.headers\)/);
   assert.match(source, /function makeMemoryServer\(authInfo\)/);
 });

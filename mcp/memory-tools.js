@@ -1,8 +1,11 @@
 import { z } from "zod";
+import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { zodToJsonSchema } from "zod-to-json-schema";
 import { assertSafeMemoryContent } from "./memory-safety.js";
 
 const PRIVATE_KEYS = /(?:namespace|credential|token|authorization|digest)/i;
 const POLICY = "共享记忆只保存 ChatGPT 与 Cyberboss 都需要知道的精炼事实；不替代 ChatGPT 小本本、Cyberboss 世界书或当前 thread，默认不得保存原始聊天。";
+const TOOL_CONTRACTS = new WeakMap();
 
 export function registerMemoryTools(server, { enabled = false, scopes = [], fetchImpl, audit = async () => {} } = {}) {
   if (!enabled) return [];
@@ -12,8 +15,21 @@ export function registerMemoryTools(server, { enabled = false, scopes = [], fetc
   const canWrite = grantedScopes.has("memory:write");
 
   const registered = [];
-  const add = (name, description, schema, callback) => {
-    server.tool(name, `${description} ${POLICY}`, schema, async (...args) => {
+  const add = (name, description, schema, callback, { write = false, destructive = false } = {}) => {
+    const scopes = write ? ["memory:read", "memory:write"] : ["memory:read"];
+    const securitySchemes = [{ type: "oauth2", scopes }];
+    const config = {
+      description: `${description} ${POLICY}`,
+      inputSchema: schema,
+      securitySchemes,
+      annotations: {
+        readOnlyHint: !write,
+        destructiveHint: destructive,
+        openWorldHint: false,
+      },
+      _meta: { securitySchemes },
+    };
+    server.registerTool(name, config, async (...args) => {
       const started = Date.now();
       try {
         const result = await callback(...args);
@@ -24,6 +40,9 @@ export function registerMemoryTools(server, { enabled = false, scopes = [], fetc
         throw error;
       }
     });
+    const contracts = TOOL_CONTRACTS.get(server) || new Map();
+    contracts.set(name, config);
+    TOOL_CONTRACTS.set(server, contracts);
     registered.push(name);
   };
 
@@ -53,6 +72,7 @@ export function registerMemoryTools(server, { enabled = false, scopes = [], fetc
         assertSafeMemoryContent(content);
         return callJson(fetchImpl, "/api/memory/active", "PUT", compact({ content, expected_revision }));
       },
+      { write: true },
     );
   }
 
@@ -72,6 +92,7 @@ export function registerMemoryTools(server, { enabled = false, scopes = [], fetc
       assertSafeMemoryContent(summary, searchable_text, source);
       return callJson(fetchImpl, "/api/memory/history", "POST", compact({ summary, searchable_text, source, occurred_at, expires_at }));
     },
+    { write: true },
   );
 
   if (canWrite) add(
@@ -82,6 +103,7 @@ export function registerMemoryTools(server, { enabled = false, scopes = [], fetc
       assertSafeMemoryContent(summary, searchable_text, source);
       return callJson(fetchImpl, `/api/memory/history/${encodeURIComponent(history_id)}`, "PATCH", compact({ summary, searchable_text, source, occurred_at, expires_at }));
     },
+    { write: true },
   );
 
   if (canWrite) add(
@@ -89,9 +111,28 @@ export function registerMemoryTools(server, { enabled = false, scopes = [], fetc
     "忘记一条共享历史记忆：清空整条修订链的正文和搜索文本；若 active memory 无法可靠自动定位会返回需人工修订。数据库备份仍可能在其保留期内存在。",
     { history_id: z.string().min(1).max(128) },
     async ({ history_id }) => callJson(fetchImpl, `/api/memory/history/${encodeURIComponent(history_id)}`, "DELETE"),
+    { write: true, destructive: true },
   );
 
   return registered;
+}
+
+export function installMemoryToolListContract(server) {
+  const contracts = TOOL_CONTRACTS.get(server);
+  if (!contracts?.size || !server?.server?.setRequestHandler) return;
+  server.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [...contracts.entries()].map(([name, config]) => ({
+      name,
+      description: config.description,
+      inputSchema: zodToJsonSchema(z.object(config.inputSchema), {
+        $refStrategy: "none",
+        target: "jsonSchema7",
+      }),
+      annotations: config.annotations,
+      securitySchemes: config.securitySchemes,
+      _meta: config._meta,
+    })),
+  }));
 }
 
 async function callJson(fetchImpl, path, method, body) {

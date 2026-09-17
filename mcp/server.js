@@ -5,8 +5,9 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 import fs from "fs";
 import path from "path";
-import { MEMORY_TOOL_NAMES, registerMemoryTools } from "./memory-tools.js";
+import { MEMORY_TOOL_NAMES, installMemoryToolListContract, registerMemoryTools } from "./memory-tools.js";
 import { MemoryOAuthError, createMemoryOAuthFromEnv } from "./memory-oauth.js";
+import { createMemoryMcpRouter } from "./memory-mcp-router.js";
 
 const PORT = Number(process.env.PORT || 8787);
 const RAW_LINJIAN_URL = (process.env.LINJIAN_URL || "").trim();
@@ -1049,6 +1050,7 @@ function makeMemoryServer(authInfo) {
     fetchImpl: memoryFetch,
     audit: writeMemoryAudit,
   });
+  installMemoryToolListContract(server);
   return server;
 }
 
@@ -2097,56 +2099,13 @@ app.post("/mcp", async (req, res) => {
   catch (err) { console.error(err); if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: String(err?.message || err) }, id: null }); }
 });
 app.get("/mcp", (_req, res) => res.status(405).json({ ok: false, error: "Use POST /mcp for Streamable HTTP MCP." }));
-app.get("/.well-known/oauth-protected-resource/mcp-memory", (_req, res) => {
-  if (!MEMORY_MCP_ENDPOINT_ENABLED || !MEMORY_MCP_TOOLS_ENABLED || !memoryOAuth) {
-    return res.status(404).json({ ok: false, error: "memory_mcp_not_enabled" });
-  }
-  return res.json(memoryOAuth.metadata());
-});
-app.post("/mcp-memory", async (req, res) => {
-  if (!MEMORY_MCP_ENDPOINT_ENABLED || !MEMORY_MCP_TOOLS_ENABLED) {
-    return res.status(404).json({ ok: false, error: "memory_mcp_not_enabled" });
-  }
-  if (!memoryOAuth || memoryOAuthConfigError || !MEMORY_MCP_WRITER_TOKEN) {
-    return res.status(503).json({ ok: false, error: "memory_mcp_not_ready" });
-  }
-  let authInfo;
-  try {
-    authInfo = await memoryOAuth.authenticate(req.headers);
-  } catch (error) {
-    if (error instanceof MemoryOAuthError) {
-      const insufficient = error.code === "memory_oauth_insufficient_scope";
-      res.setHeader("WWW-Authenticate", memoryOAuth.challenge(insufficient ? "insufficient_scope" : ""));
-      return res.status(error.status).json({ ok: false, error: error.code });
-    }
-    return res.status(401).json({ ok: false, error: "memory_oauth_invalid_token" });
-  }
-  try {
-    const server = makeMemoryServer(authInfo);
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-    res.on("close", () => transport.close());
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-  } catch {
-    if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Memory MCP request failed" }, id: null });
-  }
-});
-app.get("/mcp-memory", async (req, res) => {
-  if (!MEMORY_MCP_ENDPOINT_ENABLED || !MEMORY_MCP_TOOLS_ENABLED || !memoryOAuth || !MEMORY_MCP_WRITER_TOKEN) {
-    return res.status(404).json({ ok: false, error: "memory_mcp_not_enabled" });
-  }
-  try {
-    await memoryOAuth.authenticate(req.headers);
-  } catch (error) {
-    if (error instanceof MemoryOAuthError) {
-      const insufficient = error.code === "memory_oauth_insufficient_scope";
-      res.setHeader("WWW-Authenticate", memoryOAuth.challenge(insufficient ? "insufficient_scope" : ""));
-      return res.status(error.status).json({ ok: false, error: error.code });
-    }
-    return res.status(401).json({ ok: false, error: "memory_oauth_invalid_token" });
-  }
-  return res.status(405).json({ ok: false, error: "Use POST /mcp-memory for authenticated Streamable HTTP MCP." });
-});
+app.use(createMemoryMcpRouter({
+  enabled: MEMORY_MCP_ENDPOINT_ENABLED,
+  toolsEnabled: MEMORY_MCP_TOOLS_ENABLED,
+  writerReady: Boolean(MEMORY_MCP_WRITER_TOKEN) && !memoryOAuthConfigError,
+  oauth: memoryOAuth,
+  makeServer: makeMemoryServer,
+}));
 app.post("/mcp-wallet", async (req, res) => {
   try { const server = makeWalletTakeoutServer(); const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }); res.on("close", () => transport.close()); await server.connect(transport); await transport.handleRequest(req, res, req.body); }
   catch (err) { console.error(err); if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: String(err?.message || err) }, id: null }); }

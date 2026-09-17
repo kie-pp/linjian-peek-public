@@ -15,6 +15,7 @@
     "@modelcontextprotocol/sdk": "^1.17.4",
     "express": "^4.19.2",
     "jose": "^6.2.12",
-    "zod": "^3.23.8"
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "3.25.2"
   }
 }

@@ -2,6 +2,7 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const REQUIRED_READ_SCOPE = "memory:read";
 const WRITE_SCOPE = "memory:write";
+const INITIAL_SCOPES = `${REQUIRED_READ_SCOPE} ${WRITE_SCOPE}`;
 
 export class MemoryOAuthError extends Error {
   constructor(code, status = 401) {
@@ -12,14 +13,33 @@ export class MemoryOAuthError extends Error {
   }
 }
 
-export function createMemoryOAuth({ issuer, audience, jwksUrl, resource, allowedSubjects, verifyToken } = {}) {
+export function createMemoryOAuth({
+  issuer,
+  audience,
+  jwksUrl,
+  resource,
+  allowedSubjects,
+  verifyToken,
+  loadProviderMetadata,
+  allowInsecureLocalhost = false,
+} = {}) {
   const config = {
-    issuer: normalizeUrl(issuer, "memory_oauth_issuer_required"),
-    audience: requiredText(audience, "memory_oauth_audience_required"),
-    jwksUrl: normalizeUrl(jwksUrl, "memory_oauth_jwks_url_required"),
-    resource: normalizeUrl(resource, "memory_oauth_resource_required"),
+    issuer: normalizeUrl(issuer, "memory_oauth_issuer_required", allowInsecureLocalhost),
+    audience: normalizeUrl(audience, "memory_oauth_audience_required", allowInsecureLocalhost),
+    jwksUrl: normalizeUrl(jwksUrl, "memory_oauth_jwks_url_required", allowInsecureLocalhost),
+    resource: normalizeUrl(resource, "memory_oauth_resource_required", allowInsecureLocalhost),
     allowedSubjects: normalizeAllowedSubjects(allowedSubjects),
   };
+  if (config.audience !== config.resource) {
+    throw new MemoryOAuthError("memory_oauth_audience_resource_mismatch", 503);
+  }
+  if (new URL(config.jwksUrl).origin !== new URL(config.issuer).origin) {
+    throw new MemoryOAuthError("memory_oauth_jwks_origin_invalid", 503);
+  }
+  const resourceUrl = new URL(config.resource);
+  if (resourceUrl.pathname !== "/mcp-memory" || resourceUrl.search || resourceUrl.hash) {
+    throw new MemoryOAuthError("memory_oauth_resource_path_invalid", 503);
+  }
   const jwks = verifyToken ? null : createRemoteJWKSet(new URL(config.jwksUrl));
   const verifier = verifyToken || ((token) => verifyMemoryAccessToken(token, {
     issuer: config.issuer,
@@ -27,6 +47,9 @@ export function createMemoryOAuth({ issuer, audience, jwksUrl, resource, allowed
     jwks,
   }));
   const metadataUrl = new URL("/.well-known/oauth-protected-resource/mcp-memory", config.resource).toString();
+  const providerMetadataUrl = new URL("/.well-known/oauth-authorization-server", config.issuer).toString();
+  const providerLoader = loadProviderMetadata || (() => fetchProviderMetadata(providerMetadataUrl));
+  let providerMetadataPromise;
 
   return {
     async authenticate(headers = {}) {
@@ -61,12 +84,106 @@ export function createMemoryOAuth({ issuer, audience, jwksUrl, resource, allowed
         bearer_methods_supported: ["header"],
       };
     },
+    async validateProvider() {
+      providerMetadataPromise ||= Promise.resolve()
+        .then(() => providerLoader(providerMetadataUrl))
+        .then((metadata) => validateAuthorizationServerMetadata(metadata, {
+          issuer: config.issuer,
+          jwksUrl: config.jwksUrl,
+          allowInsecureLocalhost,
+        }))
+        .catch((error) => {
+          providerMetadataPromise = undefined;
+          if (error instanceof MemoryOAuthError) throw error;
+          throw new MemoryOAuthError("memory_oauth_provider_unavailable", 503);
+        });
+      return providerMetadataPromise;
+    },
     challenge(error = "") {
-      const fields = [`resource_metadata="${metadataUrl}"`, `scope="${REQUIRED_READ_SCOPE}"`];
-      if (error === "insufficient_scope") fields.unshift('error="insufficient_scope"');
+      const fields = [
+        'realm="shared-memory"',
+        `resource_metadata="${metadataUrl}"`,
+        `scope="${INITIAL_SCOPES}"`,
+      ];
+      if (error === "insufficient_scope") {
+        fields.push('error="insufficient_scope"', 'error_description="Required OAuth scope is missing"');
+      } else if (error === "invalid_token") {
+        fields.push('error="invalid_token"', 'error_description="OAuth access token is missing or invalid"');
+      }
       return `Bearer ${fields.join(", ")}`;
     },
+    config: Object.freeze({
+      issuer: config.issuer,
+      audience: config.audience,
+      jwksUrl: config.jwksUrl,
+      resource: config.resource,
+      metadataUrl,
+      providerMetadataUrl,
+    }),
   };
+}
+
+export function validateAuthorizationServerMetadata(metadata, {
+  issuer,
+  jwksUrl,
+  allowInsecureLocalhost = false,
+} = {}) {
+  if (!metadata || typeof metadata !== "object" || metadata.issuer !== issuer) {
+    throw new MemoryOAuthError("memory_oauth_provider_issuer_invalid", 503);
+  }
+  if (metadata.jwks_uri !== jwksUrl) {
+    throw new MemoryOAuthError("memory_oauth_provider_jwks_invalid", 503);
+  }
+  const issuerOrigin = new URL(issuer).origin;
+  const authorizationEndpoint = normalizeUrl(
+    metadata.authorization_endpoint,
+    "memory_oauth_provider_authorization_endpoint_invalid",
+    allowInsecureLocalhost,
+  );
+  const tokenEndpoint = normalizeUrl(
+    metadata.token_endpoint,
+    "memory_oauth_provider_token_endpoint_invalid",
+    allowInsecureLocalhost,
+  );
+  if (new URL(authorizationEndpoint).origin !== issuerOrigin || new URL(tokenEndpoint).origin !== issuerOrigin) {
+    throw new MemoryOAuthError("memory_oauth_provider_endpoint_origin_invalid", 503);
+  }
+  if (!Array.isArray(metadata.code_challenge_methods_supported) || !metadata.code_challenge_methods_supported.includes("S256")) {
+    throw new MemoryOAuthError("memory_oauth_provider_pkce_invalid", 503);
+  }
+  if (metadata.scopes_supported !== undefined
+    && (!Array.isArray(metadata.scopes_supported)
+      || metadata.scopes_supported.some((scope) => typeof scope !== "string" || !scope.trim()))) {
+    throw new MemoryOAuthError("memory_oauth_provider_scopes_invalid", 503);
+  }
+  if (metadata.response_types_supported !== undefined
+    && (!Array.isArray(metadata.response_types_supported) || !metadata.response_types_supported.includes("code"))) {
+    throw new MemoryOAuthError("memory_oauth_provider_response_type_invalid", 503);
+  }
+  if (metadata.grant_types_supported !== undefined
+    && (!Array.isArray(metadata.grant_types_supported) || !metadata.grant_types_supported.includes("authorization_code"))) {
+    throw new MemoryOAuthError("memory_oauth_provider_grant_type_invalid", 503);
+  }
+  const authMethods = new Set(Array.isArray(metadata.token_endpoint_auth_methods_supported)
+    ? metadata.token_endpoint_auth_methods_supported
+    : []);
+  if (!authMethods.has("none") && !authMethods.has("private_key_jwt")) {
+    throw new MemoryOAuthError("memory_oauth_provider_client_auth_invalid", 503);
+  }
+  if (metadata.client_id_metadata_document_supported !== true && !metadata.registration_endpoint) {
+    throw new MemoryOAuthError("memory_oauth_provider_client_registration_invalid", 503);
+  }
+  if (metadata.registration_endpoint) {
+    const registrationEndpoint = normalizeUrl(
+      metadata.registration_endpoint,
+      "memory_oauth_provider_client_registration_invalid",
+      allowInsecureLocalhost,
+    );
+    if (new URL(registrationEndpoint).origin !== issuerOrigin) {
+      throw new MemoryOAuthError("memory_oauth_provider_endpoint_origin_invalid", 503);
+    }
+  }
+  return metadata;
 }
 
 export async function verifyMemoryAccessToken(token, { issuer, audience, jwks }) {
@@ -87,7 +204,26 @@ export function createMemoryOAuthFromEnv(env = process.env, verifyToken) {
     resource: env.MEMORY_MCP_OAUTH_RESOURCE,
     allowedSubjects: env.MEMORY_MCP_OAUTH_ALLOWED_SUBJECTS,
     verifyToken,
+    allowInsecureLocalhost: env.NODE_ENV === "test",
   });
+}
+
+async function fetchProviderMetadata(url) {
+  let response;
+  try {
+    response = await fetch(url, {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(3000),
+    });
+  } catch {
+    throw new MemoryOAuthError("memory_oauth_provider_unavailable", 503);
+  }
+  if (!response.ok) throw new MemoryOAuthError("memory_oauth_provider_unavailable", 503);
+  try {
+    return await response.json();
+  } catch {
+    throw new MemoryOAuthError("memory_oauth_provider_metadata_invalid", 503);
+  }
 }
 
 function normalizeScopes(value) {
@@ -116,12 +252,16 @@ function requiredText(value, code) {
   return text;
 }
 
-function normalizeUrl(value, code) {
+function normalizeUrl(value, code, allowInsecureLocalhost = false) {
   const text = requiredText(value, code);
   try {
     const url = new URL(text);
-    if (url.protocol !== "https:") throw new Error("https required");
-    return url.toString();
+    const loopback = ["127.0.0.1", "localhost", "::1"].includes(url.hostname);
+    if (url.username || url.password) throw new Error("URL credentials are forbidden");
+    if (url.protocol !== "https:" && !(allowInsecureLocalhost && url.protocol === "http:" && loopback)) {
+      throw new Error("https required");
+    }
+    return text;
   } catch {
     throw new MemoryOAuthError(code, 503);
   }

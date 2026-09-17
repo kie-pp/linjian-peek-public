@@ -2,7 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
 
-import { MemoryOAuthError, createMemoryOAuth, verifyMemoryAccessToken } from "../memory-oauth.js";
+import {
+  MemoryOAuthError,
+  createMemoryOAuth,
+  validateAuthorizationServerMetadata,
+  verifyMemoryAccessToken,
+} from "../memory-oauth.js";
 
 function authWith(payload) {
   return createMemoryOAuth({
@@ -24,7 +29,10 @@ test("missing bearer token is rejected without exposing any tools", async () => 
     auth.authenticate({}),
     (error) => error instanceof MemoryOAuthError && error.status === 401 && error.code === "memory_oauth_required",
   );
-  assert.match(auth.challenge(), /resource_metadata=/);
+  assert.equal(
+    auth.challenge("invalid_token"),
+    'Bearer realm="shared-memory", resource_metadata="https://memory.example.test/.well-known/oauth-protected-resource/mcp-memory", scope="memory:read memory:write", error="invalid_token", error_description="OAuth access token is missing or invalid"',
+  );
   assert.doesNotMatch(auth.challenge(), /valid-test-token/);
 });
 
@@ -63,6 +71,87 @@ test("protected resource metadata points to the external authorization server", 
     scopes_supported: ["memory:read", "memory:write"],
     bearer_methods_supported: ["header"],
   });
+});
+
+test("resource, audience, and endpoint path must identify the same mcp-memory resource", () => {
+  assert.throws(
+    () => createMemoryOAuth({
+      issuer: "https://auth.example.test",
+      audience: "https://memory.example.test/other",
+      jwksUrl: "https://auth.example.test/.well-known/jwks.json",
+      resource: "https://memory.example.test/mcp-memory",
+      allowedSubjects: ["user-1"],
+      verifyToken: async () => ({}),
+    }),
+    (error) => error instanceof MemoryOAuthError && error.code === "memory_oauth_audience_resource_mismatch",
+  );
+  assert.throws(
+    () => createMemoryOAuth({
+      issuer: "https://auth.example.test",
+      audience: "https://memory.example.test/not-memory",
+      jwksUrl: "https://auth.example.test/.well-known/jwks.json",
+      resource: "https://memory.example.test/not-memory",
+      allowedSubjects: ["user-1"],
+      verifyToken: async () => ({}),
+    }),
+    (error) => error instanceof MemoryOAuthError && error.code === "memory_oauth_resource_path_invalid",
+  );
+  assert.throws(
+    () => createMemoryOAuth({
+      issuer: "https://user:password@auth.example.test",
+      audience: "https://memory.example.test/mcp-memory",
+      jwksUrl: "https://auth.example.test/.well-known/jwks.json",
+      resource: "https://memory.example.test/mcp-memory",
+      allowedSubjects: ["user-1"],
+      verifyToken: async () => ({}),
+    }),
+    (error) => error instanceof MemoryOAuthError && error.code === "memory_oauth_issuer_required",
+  );
+  assert.throws(
+    () => createMemoryOAuth({
+      issuer: "https://auth.example.test",
+      audience: "https://memory.example.test/mcp-memory",
+      jwksUrl: "https://keys.example.test/.well-known/jwks.json",
+      resource: "https://memory.example.test/mcp-memory",
+      allowedSubjects: ["user-1"],
+      verifyToken: async () => ({}),
+    }),
+    (error) => error instanceof MemoryOAuthError && error.code === "memory_oauth_jwks_origin_invalid",
+  );
+});
+
+test("authorization server metadata must match issuer, JWKS, authorization code, and PKCE S256", () => {
+  const expected = {
+    issuer: "https://auth.example.test",
+    jwksUrl: "https://auth.example.test/.well-known/jwks.json",
+  };
+  const valid = {
+    issuer: expected.issuer,
+    authorization_endpoint: "https://auth.example.test/oauth2/authorize",
+    token_endpoint: "https://auth.example.test/oauth2/token",
+    jwks_uri: expected.jwksUrl,
+    registration_endpoint: "https://auth.example.test/oauth2/register",
+    code_challenge_methods_supported: ["S256"],
+    scopes_supported: ["openid", "profile", "offline_access"],
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    token_endpoint_auth_methods_supported: ["none"],
+  };
+  assert.equal(validateAuthorizationServerMetadata(valid, expected).issuer, expected.issuer);
+  for (const [field, value] of [
+    ["issuer", { ...valid, issuer: "https://other.example.test" }],
+    ["jwks", { ...valid, jwks_uri: "https://other.example.test/jwks" }],
+    ["pkce", { ...valid, code_challenge_methods_supported: ["plain"] }],
+    ["scopes", { ...valid, scopes_supported: ["openid", ""] }],
+    ["response_type", { ...valid, response_types_supported: ["token"] }],
+    ["grant_type", { ...valid, grant_types_supported: ["client_credentials"] }],
+    ["endpoint_origin", { ...valid, token_endpoint: "https://other.example.test/oauth2/token" }],
+  ]) {
+    assert.throws(
+      () => validateAuthorizationServerMetadata(value, expected),
+      (error) => error instanceof MemoryOAuthError && error.code === `memory_oauth_provider_${field}_invalid`,
+    );
+  }
 });
 
 test("real JWT verification enforces signature issuer audience and expiry", async () => {

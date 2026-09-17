@@ -38,12 +38,11 @@ Cyberboss 配置 server 的 `/api/memory/context` 地址，并只使用 reader T
 
 公开 `/mcp` 始终不注册共享记忆工具，保持现有 ChatGPT 掌心窗连接兼容。共享记忆只通过独立的 `/mcp-memory` 暴露；该入口必须先完成 OAuth 2.1 Bearer Token 校验，缺少认证时返回 401，不会创建 MCP server 实例，也无法列出工具。
 
-推荐直接使用成熟身份提供方，不在掌心窗内实现授权服务器：
+使用 **Auth0** 作为本补丁选定的身份提供方，不在掌心窗内实现授权服务器。Auth0 已提供 MCP OAuth、PKCE S256、动态客户端注册、JWT/JWKS 和自定义 API scope。WorkOS 仍可作为以后替代方案，但本补丁不混用两套控制台契约。
 
-- **WorkOS AuthKit（优先）**：提供 MCP/OAuth、动态客户端注册、托管登录与 JWKS；当前 AuthKit 前 100 万 MAU 免费，但生产环境需要添加账单信息。配置说明：<https://workos.com/docs/authkit/mcp>，价格：<https://workos.com/pricing>。
-- **Auth0（备选）**：提供 MCP OAuth 指南、PKCE、资源参数和 JWKS；当前 Free 计划最高 25,000 MAU，无需信用卡即可注册。配置说明：<https://auth0.com/ai/docs/mcp/get-started/authorization-for-your-mcp-server>，价格：<https://auth0.com/pricing>。
+Auth0 中将 `https://<mcp-domain>/mcp-memory` 创建为 API Identifier，并定义 `memory:read`、`memory:write` 两个权限。开启 RBAC 及“Add Permissions in the Access Token”，为 reader 角色只分配 `memory:read`，为 writer 角色分配两项权限。令牌中的 `aud` 必须与 API Identifier、`MEMORY_MCP_OAUTH_AUDIENCE`、`MEMORY_MCP_OAUTH_RESOURCE` 逐字一致。MCP 服务只作为 OAuth resource server，使用 `jose` 从 `MEMORY_MCP_OAUTH_JWKS_URL` 校验签名，同时校验 issuer、audience、过期时间和 `scope`/`permissions`；不会签发或保存 ChatGPT 的 access token。
 
-两种方案都必须签发 audience 精确指向 `/mcp-memory` 的 JWT，并提供 `memory:read`、`memory:write` scope。MCP 服务只作为 OAuth resource server，使用 `jose` 从 `MEMORY_MCP_OAUTH_JWKS_URL` 校验签名，同时校验 issuer、audience、过期时间和 scope；不会签发 Token，也不会保存 ChatGPT 的 access token。
+Auth0 的通用授权服务器元数据不一定列出某个 API 的自定义 scope，因此服务端不会错误要求 `scopes_supported` 必须出现 `memory:*`。业务权限仍同时出现在受保护资源元数据、每个工具的 `securitySchemes` 以及最终 access token 的 `scope`/`permissions` 中，并由服务端逐次强制执行。
 
 启用前配置：
 
@@ -56,6 +55,15 @@ Cyberboss 配置 server 的 `/api/memory/context` 地址，并只使用 reader T
 - `MEMORY_MCP_OAUTH_ALLOWED_SUBJECTS`（只填写获准使用该单用户记忆空间的稳定 OAuth subject ID；多个值用逗号分隔）
 
 认证后的 reader 只注册 `get_memory_context`、`get_active_memory`、`search_memory`；只有同时获得 `memory:write` 的客户端才注册四个写工具。签名正确但 subject 不在 allowlist 的 Token 仍会被拒绝。未认证客户端以及现有 `/mcp` 都看不到这七个工具。OAuth 服务需支持 PKCE、RFC 9728 Protected Resource Metadata、授权服务器发现和 refresh token；为 ChatGPT 配置时应允许 `offline_access`，避免短期 Token 过期后频繁重连。
+
+Auth0 控制台还需完成以下一致性配置：
+
+1. `Applications -> APIs`：API Identifier 精确填写 `https://<mcp-domain>/mcp-memory`，签名算法使用 RS256，添加两个 `memory:*` 权限。
+2. API RBAC：开启 RBAC 和 access token permissions；测试 reader、writer 使用不同角色或不同测试用户。
+3. `Settings -> Advanced`：若 ChatGPT 使用动态客户端注册，开启 DCR。DCR 是公开注册入口，应结合 Auth0 的第三方应用默认权限和 ACL 限制滥用。API 的两项 scope 可以进入 DCR client 的可请求范围，但最终授予仍必须由用户角色限制：reader 只得到读权限，writer 才得到读写权限。
+4. `Settings -> Tenant Settings -> API Authorization Settings`：开启 Resource Parameter Compatibility Profile，并把 Default Audience 设为同一个 API Identifier，确保 ChatGPT 发送的 `resource` 得到同 audience 的 JWT。
+5. 为 DCR 创建的第三方应用开放可用的登录 connection；授权码流程必须为 PKCE S256，并允许 `authorization_code`、`refresh_token` 与 `offline_access`。
+6. issuer 使用 Auth0 租户域名（通常带结尾 `/`），JWKS 使用同一租户的 `/.well-known/jwks.json`；实际值必须与 Auth0 元数据逐字一致。
 
 启用后检查七个工具：`get_memory_context`、`get_active_memory`、`search_memory`、`set_active_memory`、`append_memory`、`revise_memory`、`forget_memory`。工具参数和结果都不应出现 namespace、`device_id` 或凭据。写入内容会在 MCP 与 server 两层经过敏感内容拒绝器；修订新增后继记录。
 
@@ -73,11 +81,26 @@ Cyberboss 配置 server 的 `/api/memory/context` 地址，并只使用 reader T
 
 ## 8. ChatGPT 连接验证
 
-先在身份提供方创建测试用户、OAuth resource/audience 和 scopes，确认授权服务器元数据包含 PKCE、refresh token/`offline_access`，再把 ChatGPT 连接地址设为 `https://<mcp-domain>/mcp-memory`。连接时应先收到 401 与 `WWW-Authenticate`，随后跳转到身份提供方登录；授权后扫描工具，reader 只能看到三项读取工具，writer 才能看到全部七项。
+先在 Auth0 创建隔离测试用户、API、角色和权限，确认授权服务器元数据包含 PKCE S256、授权码流程及 refresh token/`offline_access`，再把 ChatGPT 连接地址设为 `https://<mcp-domain>/mcp-memory`。连接时应先收到带 `resource_metadata` 的 401 `WWW-Authenticate`，随后完成 Auth0 登录；授权后扫描工具，reader 只能看到三项读取工具，writer 才能看到全部七项。
 
-截至 2026 年 9 月，OpenAI 官方说明中的完整自定义 MCP 写操作主要面向 ChatGPT Business、Enterprise/Edu；Pro 的自定义 MCP 仍偏向读取能力。ChatGPT Plus 是否在当前账户界面开放自定义 OAuth MCP 写工具，必须在实际 `设置 -> 应用` 页面验证，不能仅凭后端实现推定可用。若 Plus 页面没有“创建应用/自定义 MCP”入口，应保持 `/mcp-memory` 关闭，不要退回未认证 writer。
+截至本文核对时，OpenAI 官方说明中完整 MCP（包括写入/修改）面向 ChatGPT Business、Enterprise/Edu；Pro 仅能在 developer mode 使用 read/fetch MCP。个人 Plus 是否显示自定义应用入口必须以账户页面为准，不能凭后端实现推定。没有可创建 OAuth 自定义应用的入口时，应保持 `/mcp-memory` 关闭，不得回退到未认证 writer。
 
-## 9. 本地 PostgreSQL 集成测试
+ChatGPT 实测前需要在页面完成：
+
+1. 确认当前套餐和 workspace 具有 `Settings/Workspace settings -> Apps -> Create` 及 developer mode 权限。
+2. 在 Auth0 完成上述 API、角色、测试用户、DCR/CIMD、connection、resource/audience 与 refresh token 配置。
+3. 部署到隔离测试域名后，把该域名的完整 `/mcp-memory` URL 填入 ChatGPT 自定义应用，选择 OAuth 并执行 Scan Tools。
+4. 分别用 reader 和 writer 测试身份登录，核对工具数、写操作确认提示和 token 刷新。不要使用生产日记、生产记忆或生产凭据。
+
+本地测试已经覆盖完整发现、401 登录挑战、授权服务器元数据、DCR、授权码、PKCE S256、resource 参数、JWT audience、reader/writer 工具隔离及无效令牌/权限不足响应。它不能替代 ChatGPT 页面与 Auth0 真实租户的兼容性实测。
+
+## 9. 现有公开 `/mcp` 风险
+
+现有 `/mcp` 为兼容当前掌心窗连接而保持不变，并明确排除全部七个共享记忆工具。但该入口本身没有独立客户端认证，仍暴露原有的写入和设备控制工具，例如账单增删改、日记写入/删除、通知、闹钟、应用控制和屏幕休息。`LINJIAN_TOKEN` 只保护 MCP 到 server 的后端调用，不能证明调用 `/mcp` 的客户端身份。因此公网 URL 泄露时存在未授权工具调用风险。
+
+本阶段不改动 `/mcp`，以免破坏现有 ChatGPT 掌心窗连接。后续应为整个原入口增加独立 OAuth 或先拆分只读/写入路由；在完成迁移前，应限制域名暴露、监控调用记录，并继续让高风险动作依赖服务端确认约束。
+
+## 10. 本地 PostgreSQL 集成测试
 
 测试只接受显式设置的本机 `TEST_DATABASE_URL`，主机必须是 `127.0.0.1`、`localhost` 或 `::1`。未设置或指向非本机地址时测试会明确跳过，不会连接 Railway：
 
