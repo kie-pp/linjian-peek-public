@@ -74,8 +74,11 @@ jobs:
         with:
           node-version: "24"
 
+      - name: Enable pnpm
+        run: corepack enable
+
       - name: Install MCP dependencies
-        run: npm install --prefix mcp --ignore-scripts --no-audit --no-fund
+        run: pnpm --dir mcp install --frozen-lockfile --ignore-scripts
 
       - name: Run MCP tests
         run: npm test --prefix mcp
