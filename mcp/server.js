@@ -1054,6 +1054,20 @@ function makeMemoryServer(authInfo) {
   return server;
 }
 
+function makeMemoryDiscoveryServer() {
+  const server = new McpServer({ name: "掌心窗共享记忆", version: "0.3.7.9" });
+  registerMemoryTools(server, {
+    enabled: true,
+    scopes: ["memory:read", "memory:write"],
+    fetchImpl: async () => new Response(JSON.stringify({ error: "memory_oauth_required" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    }),
+  });
+  installMemoryToolListContract(server);
+  return server;
+}
+
 function makeServer() {
   const server = new McpServer({ name: "掌心窗", version: "0.3.7.9" });
   const commandBackedTools = new Set([
@@ -2105,6 +2119,7 @@ app.use(createMemoryMcpRouter({
   writerReady: Boolean(MEMORY_MCP_WRITER_TOKEN) && !memoryOAuthConfigError,
   oauth: memoryOAuth,
   makeServer: makeMemoryServer,
+  makeDiscoveryServer: makeMemoryDiscoveryServer,
 }));
 app.post("/mcp-wallet", async (req, res) => {
   try { const server = makeWalletTakeoutServer(); const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }); res.on("close", () => transport.close()); await server.connect(transport); await transport.handleRequest(req, res, req.body); }

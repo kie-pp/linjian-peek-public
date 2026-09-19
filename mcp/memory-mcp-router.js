@@ -8,6 +8,7 @@ export function createMemoryMcpRouter({
   writerReady = false,
   oauth,
   makeServer,
+  makeDiscoveryServer,
 } = {}) {
   const router = express.Router();
   const configured = enabled && toolsEnabled;
@@ -45,10 +46,17 @@ export function createMemoryMcpRouter({
   };
 
   router.post("/mcp-memory", async (req, res) => {
-    const authInfo = await authenticate(req, res);
-    if (!authInfo) return;
+    const discoveryOnly = !/^Bearer\s+\S+$/i.test(String(req.headers.authorization || ""))
+      && ["initialize", "notifications/initialized", "tools/list"].includes(String(req.body?.method || ""));
+    let authInfo = null;
+    if (!discoveryOnly) {
+      authInfo = await authenticate(req, res);
+      if (!authInfo) return;
+    } else if (!configured || !oauth || !writerReady || typeof makeDiscoveryServer !== "function") {
+      return res.status(503).json({ ok: false, error: "memory_mcp_not_ready" });
+    }
     try {
-      const server = makeServer(authInfo);
+      const server = discoveryOnly ? makeDiscoveryServer() : makeServer(authInfo);
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
       res.on("close", () => transport.close());
       await server.connect(transport);

@@ -136,12 +136,26 @@ test("local OAuth discovery, PKCE login, reader/writer MCP permissions, and publ
       installMemoryToolListContract(server);
       return server;
     };
+    const makeDiscoveryServer = () => {
+      const server = new McpServer({ name: "local-memory", version: "1.0.0" });
+      registerMemoryTools(server, {
+        enabled: true,
+        scopes: ["memory:read", "memory:write"],
+        fetchImpl: async () => new Response(JSON.stringify({ error: "memory_oauth_required" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        }),
+      });
+      installMemoryToolListContract(server);
+      return server;
+    };
     memoryApp.use(createMemoryMcpRouter({
       enabled: true,
       toolsEnabled: true,
       writerReady: true,
       oauth,
       makeServer,
+      makeDiscoveryServer,
     }));
     memoryApp.post("/mcp", (_req, res) => res.json({
       jsonrpc: "2.0",
@@ -159,6 +173,29 @@ test("local OAuth discovery, PKCE login, reader/writer MCP permissions, and publ
     const protectedMetadata = await fetch(metadataUrl).then((response) => response.json());
     assert.equal(protectedMetadata.resource, resource);
     assert.deepEqual(protectedMetadata.authorization_servers, [issuer]);
+
+    const anonymousClient = new Client({ name: "local-chatgpt-scanner", version: "1.0.0" });
+    const anonymousTransport = new StreamableHTTPClientTransport(new URL(resource));
+    await anonymousClient.connect(anonymousTransport);
+    clients.push(anonymousClient);
+    const anonymousTools = await anonymousClient.listTools();
+    assert.equal(anonymousTools.tools.length, 7);
+    assert.ok(anonymousTools.tools.every((tool) => (
+      tool.securitySchemes?.[0]?.type === "oauth2" || tool._meta?.securitySchemes?.[0]?.type === "oauth2"
+    )));
+
+    const anonymousCall = await fetch(resource, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 90,
+        method: "tools/call",
+        params: { name: "get_active_memory", arguments: {} },
+      }),
+    });
+    assert.equal(anonymousCall.status, 401);
+    assert.match(anonymousCall.headers.get("www-authenticate"), /error="invalid_token"/);
 
     const providerMetadata = await fetch(`${issuer}/.well-known/oauth-authorization-server`).then((response) => response.json());
     assert.equal(providerMetadata.issuer, issuer);
